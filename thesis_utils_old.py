@@ -20,14 +20,17 @@ notebook:
 
 import os
 import csv
+import json
 import time
 import numpy as np
 import pandas as pd
 import torch
+import matplotlib.pyplot as plt
 
 from datasets import Dataset
 from transformers import (
     AutoTokenizer,
+    DataCollatorWithPadding,
     AutoModelForSequenceClassification,
     TrainingArguments,
     Trainer,
@@ -35,7 +38,7 @@ from transformers import (
     EarlyStoppingCallback,
     set_seed,
 )
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -44,7 +47,7 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 # function differ between methods.
 # ═══════════════════════════════════════════════════════════════════════════
 
-MODEL_NAME = "indobenchmark/indobert-base-p1"
+MODEL_NAME = "indobenchmark/indobert-base-p2"
 MAX_LENGTH = 128
 BATCH_SIZE = 16
 MAX_EPOCHS = 15
@@ -54,10 +57,17 @@ ID2LABEL = {0: "fact", 1: "hoax"}
 SEEDS = [42, 123, 456]
 
 # ── Paths -- adjust these to match your Drive layout ────────────────────────
-# DATA_DIR = "/content/drive/MyDrive/thesis/data"          # expects train.csv, val.csv, test.csv
-DATA_DIR = "/datasets"
-RESULTS_PATH = "/results.csv"
-PREDICTIONS_PATH = "/predictions.csv"
+#DATA_DIR = "/content/drive/MyDrive/thesis/data"          # expects train.csv, val.csv, test.csv
+#RESULTS_PATH = "/content/drive/MyDrive/thesis/results.csv"
+#PREDICTIONS_PATH = "/content/drive/MyDrive/thesis/predictions.csv"
+#LOGS_DIR = "/content/drive/MyDrive/thesis/logs"           # per-run training history, for plotting
+#RUNS_DIR = "/content/runs"                                 # local scratch, not Drive (checkpoints are large)
+
+# New Datasets
+DATA_DIR = "/content/drive/MyDrive/thesis/data/split_70_10_20"          # expects train.csv, val.csv, test.csv
+RESULTS_PATH = "/content/drive/MyDrive/thesis/new_results.csv"
+PREDICTIONS_PATH = "/content/drive/MyDrive/thesis/new_predictions.csv"
+LOGS_DIR = "/content/drive/MyDrive/thesis/logs/new"           # per-run training history, for plotting
 RUNS_DIR = "/content/runs"                                 # local scratch, not Drive (checkpoints are large)
 
 
@@ -68,7 +78,7 @@ RUNS_DIR = "/content/runs"                                 # local scratch, not 
 def load_datasets(tokenizer):
     """Load the fixed train/val/test CSVs and tokenize consistently.
 
-    Expects each CSV to have 'title' and 'label' columns, with label already
+    Expects each CSV to have 'berita' and 'label' columns, with label already
     encoded as 0 (fact) / 1 (hoax). Adjust the label mapping below if your
     CSVs still store string labels.
     """
@@ -77,8 +87,8 @@ def load_datasets(tokenizer):
     test_df = pd.read_csv(f"{DATA_DIR}/test.csv")
 
     for name, df in [("train", train_df), ("val", val_df), ("test", test_df)]:
-        assert "title" in df.columns and "label" in df.columns, \
-            f"{name}.csv must have 'title' and 'label' columns, got {list(df.columns)}"
+        assert "berita" in df.columns and "label" in df.columns, \
+            f"{name}.csv must have 'berita' and 'label' columns, got {list(df.columns)}"
 
     # If labels are still strings ("fact"/"hoax"), map them to ints here.
     for df in (train_df, val_df, test_df):
@@ -86,19 +96,14 @@ def load_datasets(tokenizer):
             df["label"] = df["label"].map(LABEL2ID)
 
     def to_hf_dataset(df):
-        return Dataset.from_pandas(df[["title", "label"]].reset_index(drop=True))
+        return Dataset.from_pandas(df[["berita", "label"]].reset_index(drop=True))
 
     train_ds = to_hf_dataset(train_df)
     val_ds = to_hf_dataset(val_df)
     test_ds = to_hf_dataset(test_df)
 
     def tokenize_fn(batch):
-        return tokenizer(
-            batch["title"],
-            padding="max_length",
-            truncation=True,
-            max_length=MAX_LENGTH,
-        )
+        return tokenizer(batch["berita"], truncation=True, max_length=MAX_LENGTH)
 
     train_ds = train_ds.map(tokenize_fn, batched=True)
     val_ds = val_ds.map(tokenize_fn, batched=True)
@@ -114,21 +119,6 @@ def load_datasets(tokenizer):
     test_ds.set_format(type="torch", columns=columns)
 
     return train_ds, val_ds, test_ds
-
-
-def check_train_test_leakage():
-    """One-time sanity check: exact-duplicate titles shared between train and
-    test would inflate every method's accuracy by the same amount. Run this
-    once after the split is created, not per-method/per-seed."""
-    train_df = pd.read_csv(f"{DATA_DIR}/train.csv")
-    test_df = pd.read_csv(f"{DATA_DIR}/test.csv")
-    overlap = set(train_df["title"]) & set(test_df["title"])
-    print(f"Exact duplicate titles between train/test: {len(overlap)}")
-    if len(overlap) > 0:
-        print("Sample overlapping titles:")
-        for t in list(overlap)[:5]:
-            print(" -", t)
-    return overlap
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -265,6 +255,7 @@ def run_experiment(method_name, seed, model_init_fn, learning_rate,
         report_to="none",
         seed=seed,
         disable_tqdm=False,
+        dataloader_num_workers=2,
     )
 
     timing_cb = TimingCallback()
@@ -274,6 +265,7 @@ def run_experiment(method_name, seed, model_init_fn, learning_rate,
         args=args,
         train_dataset=train_ds,
         eval_dataset=val_ds,
+        data_collator=DataCollatorWithPadding(tokenizer),
         compute_metrics=compute_metrics,
         callbacks=[
             EarlyStoppingCallback(early_stopping_patience=EARLY_STOP_PATIENCE),
@@ -284,6 +276,14 @@ def run_experiment(method_name, seed, model_init_fn, learning_rate,
     t0 = time.time()
     trainer.train()
     total_time_s = time.time() - t0
+
+    # Save full epoch-by-epoch history now, while the Trainer object still
+    # exists -- plotting functions read this back later without needing to
+    # keep the Trainer (or even this session) alive.
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    history_path = f"{LOGS_DIR}/{method_name}_{seed}_history.json"
+    with open(history_path, "w") as f:
+        json.dump(trainer.state.log_history, f)
 
     # load_best_model_at_end=True already restored the best-val-F1 checkpoint
     # -- do not evaluate the last epoch's weights instead.
@@ -318,10 +318,205 @@ def run_experiment(method_name, seed, model_init_fn, learning_rate,
     }
 
     log_result(row, results_path)
-    log_predictions(method_name, seed, test_ds["labels"].numpy(), preds, predictions_path)
+    log_predictions(method_name, seed, test_ds["labels"], preds, predictions_path)
 
     print(f"\nTest results -- Acc: {row['accuracy']:.4f} | F1: {row['f1']:.4f} | "
           f"Peak VRAM: {row['peak_vram_gb']} GB | "
           f"Total time: {total_time_s/60:.1f} min | Epochs: {epochs_run}")
 
     return row
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VISUALIZATION -- call these after run_experiment() finishes for a method.
+# All read back from the CSVs/JSON already written by run_experiment, so
+# they work even in a fresh session (e.g. re-opening the notebook later)
+# as long as Drive is mounted and that method's runs have been logged.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_FOREST = {
+    "blue": "#2a78d6", "green": "#008300", "magenta": "#e87ba4",
+    "yellow": "#eda100", "aqua": "#1baf7a", "orange": "#eb6834",
+}
+
+
+def _load_history(method, seed, logs_dir=LOGS_DIR):
+    path = f"{logs_dir}/{method}_{seed}_history.json"
+    with open(path) as f:
+        return json.load(f)
+
+
+def plot_training_curves(method, seed, logs_dir=LOGS_DIR):
+    """
+    Plot training loss vs validation loss across epochs.
+
+    Useful for detecting:
+      - Overfitting: train loss keeps decreasing while val loss increases
+      - Underfitting: both losses remain high / decrease slowly
+      - Good generalization: both losses decrease and remain relatively close
+
+    Also marks the epoch with the best validation F1, which is the
+    checkpoint restored by load_best_model_at_end=True.
+    """
+    try:
+        history = _load_history(method, seed, logs_dir)
+    except FileNotFoundError:
+        print(f"No saved history for {method} seed={seed} yet -- run it first.")
+        return
+
+    # Training loss is logged at the end of each epoch
+    train_epochs = [e["epoch"] for e in history if "loss" in e]
+    train_loss = [e["loss"] for e in history if "loss" in e]
+
+    # Validation loss/metrics are logged during evaluation
+    eval_entries = [e for e in history if "eval_loss" in e]
+
+    eval_epochs = [e["epoch"] for e in eval_entries]
+    eval_loss = [e["eval_loss"] for e in eval_entries]
+    eval_f1 = [e.get("eval_f1") for e in eval_entries]
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+
+    # Training loss
+    ax.plot(
+        train_epochs,
+        train_loss,
+        marker="o",
+        label="Training Loss",
+        color=_FOREST["blue"]
+    )
+
+    # Validation loss
+    ax.plot(
+        eval_epochs,
+        eval_loss,
+        marker="s",
+        label="Validation Loss",
+        color=_FOREST["orange"]
+    )
+
+    # Mark best validation F1 checkpoint
+    valid_f1 = [
+        (epoch, f1)
+        for epoch, f1 in zip(eval_epochs, eval_f1)
+        if f1 is not None
+    ]
+
+    if valid_f1:
+        best_epoch, best_f1 = max(valid_f1, key=lambda x: x[1])
+
+        ax.axvline(
+            best_epoch,
+            color="gray",
+            linestyle="--",
+            alpha=0.6,
+            label=f"Best Val F1 (epoch {best_epoch:g})"
+        )
+
+    ax.set_title(f"{method} (seed {seed}) — Training vs Validation Loss")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_seeds_overlay(method, seeds=SEEDS, logs_dir=LOGS_DIR):
+    """Overlay validation F1 curves across all seeds for one method --
+    a quick visual check for how consistent (or noisy) training is across
+    seeds, before trusting the mean+-std in the summary table."""
+    colors = list(_FOREST.values())
+    fig, ax = plt.subplots(figsize=(6.5, 4))
+    plotted = 0
+    for i, seed in enumerate(seeds):
+        try:
+            history = _load_history(method, seed, logs_dir)
+        except FileNotFoundError:
+            continue
+        eval_epochs = [e["epoch"] for e in history if "eval_f1" in e]
+        eval_f1 = [e["eval_f1"] for e in history if "eval_f1" in e]
+        ax.plot(eval_epochs, eval_f1, marker="o", label=f"seed {seed}",
+                 color=colors[i % len(colors)])
+        plotted += 1
+    if plotted == 0:
+        print(f"No saved history for {method} yet -- run it first.")
+        plt.close(fig)
+        return
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Validation F1")
+    ax.set_title(f"{method} -- validation F1 across seeds")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_confusion_matrix(method, seed, predictions_path=PREDICTIONS_PATH):
+    """Confusion matrix on the test set for ONE (method, seed) run."""
+    df = pd.read_csv(predictions_path)
+    subset = df[(df["method"] == method) & (df["seed"] == seed)]
+    if subset.empty:
+        print(f"No predictions logged yet for {method} seed={seed}.")
+        return None
+
+    cm = confusion_matrix(subset["true_label"], subset["predicted_label"])
+    labels = [ID2LABEL[0], ID2LABEL[1]]
+
+    fig, ax = plt.subplots(figsize=(4, 4))
+    ax.imshow(cm, cmap="Blues")
+    ax.set_xticks([0, 1]); ax.set_xticklabels(labels)
+    ax.set_yticks([0, 1]); ax.set_yticklabels(labels)
+    ax.set_xlabel("Predicted"); ax.set_ylabel("True")
+    ax.set_title(f"{method} (seed {seed})")
+
+    for i in range(2):
+        for j in range(2):
+            ax.text(j, i, cm[i, j], ha="center", va="center",
+                     color="white" if cm[i, j] > cm.max() / 2 else "black")
+
+    plt.tight_layout()
+    plt.show()
+    return cm
+
+
+def plot_method_summary(method, results_path=RESULTS_PATH):
+    """Bar chart (mean +- std across seeds) of validation F1, test metrics,
+    VRAM, and training time for one method -- plus the raw per-seed table.
+    Val F1 is included alongside the test metrics specifically so a gap
+    between them (like the one seen for LoRA/BitFit in the pilot) is
+    visible immediately, not just discoverable by cross-referencing columns."""
+    df = pd.read_csv(results_path)
+    subset = df[df["method"] == method]
+    if subset.empty:
+        print(f"No results logged yet for {method}.")
+        return
+
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+
+    perf_cols = ["best_val_f1", "accuracy", "precision", "recall", "f1"]
+    perf_labels = ["Val F1\n(best)", "Test\nAcc", "Test\nPrec", "Test\nRec", "Test\nF1"]
+    means = [subset[c].mean() for c in perf_cols]
+    stds = [subset[c].std() for c in perf_cols]
+    bar_colors = [_FOREST["yellow"]] + [_FOREST["blue"]] * 4  # val F1 stands out from test metrics
+    axes[0].bar(perf_labels, means, yerr=stds, capsize=4, color=bar_colors)
+    axes[0].set_ylim(0, 1)
+    axes[0].set_title(f"{method} -- performance (n={len(subset)} seeds)")
+    axes[0].grid(alpha=0.3, axis="y")
+
+    axes[1].bar(["Peak VRAM (GB)"], [subset["peak_vram_gb"].mean()],
+                 yerr=[subset["peak_vram_gb"].std()], capsize=4, color=_FOREST["orange"])
+    axes[1].set_title("Peak VRAM")
+    axes[1].grid(alpha=0.3, axis="y")
+
+    axes[2].bar(["Total time (min)"], [subset["total_time_s"].mean() / 60],
+                 yerr=[subset["total_time_s"].std() / 60], capsize=4, color=_FOREST["aqua"])
+    axes[2].set_title("Total training time")
+    axes[2].grid(alpha=0.3, axis="y")
+
+    plt.tight_layout()
+    plt.show()
+
+    display_cols = ["seed"] + perf_cols + ["trainable_pct", "peak_vram_gb", "total_time_s", "epochs_run"]
+    print(subset[display_cols].to_string(index=False))
