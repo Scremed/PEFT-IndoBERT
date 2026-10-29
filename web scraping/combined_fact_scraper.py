@@ -1,15 +1,4 @@
-#!/usr/bin/env python3
-"""
-Scraper judul + tanggal berita (Detik, Kompas, Tempo), Jan 2024 - sekarang.
-
-Tahapan:
-  python news_scraper.py test     # cek 1 hari per sumber (jalankan dulu!)
-  python news_scraper.py scrape   # ambil data mentah per hari (resumable, cache di raw_cache.jsonl)
-  python news_scraper.py build    # dedup (exact + semantik) + sampling merata -> news_dataset.csv
-
-Dependensi:
-  pip install requests beautifulsoup4 sentence-transformers numpy
-"""
+# Scraper Title + Date (Detik, Kompas, Tempo), Jan 2024 - September 2026.
 import argparse
 import json
 import random
@@ -27,26 +16,25 @@ from urllib.robotparser import RobotFileParser
 import requests
 from bs4 import BeautifulSoup
 
-# ------------------------------------------------------------------ konfigurasi
+# Configuration
 START = date(2024, 1, 1)
 END = date(2026, 9, 23)          
-TARGET_TOTAL = 6394              # total baris akhir (gabungan 3 sumber)
-PER_DAY = 4                      # judul yang diambil per sumber per hari (dibagi: halaman 1 + 1 halaman acak)
-MAX_PAGE_FALLBACK = 5            # dipakai jika jumlah halaman indeks tidak terdeteksi
+TARGET_TOTAL = 6394         
+PER_DAY = 4                     
+MAX_PAGE_FALLBACK = 5         
 SEED = 42
-DELAY = (3.5, 10.8)             # jeda acak antar request (detik) - jangan terlalu agresif
-SEM_THRESHOLD = 0.78             # cosine similarity >= ini dianggap berita yang sama
-SEM_WINDOW_DAYS = 3              # bandingkan hanya dengan berita +-3 hari
+DELAY = (3.5, 10.8)         
+SEM_THRESHOLD = 0.78      
+SEM_WINDOW_DAYS = 3   
 EMB_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 CACHE = Path("raw_cache.jsonl")
-OUT = Path("news_dataset.csv")
+OUT = Path("datasets/raw/fact_news_dataset.csv")
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 research-scraper"
 }
 
-# URL indeks harian + CSS selector judul (urut dari yang paling spesifik).
-# CATATAN: struktur situs bisa berubah -> cek dengan `test`, sesuaikan bila perlu.
+# URL daily news index 
 SOURCES = {
     "detik": {
         "url": lambda d, p: f"https://news.detik.com/indeks?page={p}&date={d.strftime('%m/%d/%Y')}",
@@ -66,7 +54,7 @@ SOURCES = {
     },
 }
 
-# ------------------------------------------------------------------ util
+# Util
 _robots = {}
 
 
@@ -104,7 +92,7 @@ def daterange(a, b):
 
 
 def fetch_titles(source, d, session, page=1):
-    """Return (titles, max_page) atau None jika gagal/diblokir."""
+    """Return (titles, max_page) or None if failed/blocked."""
     cfg = SOURCES[source]
     url = cfg["url"](d, page)
     if not allowed(url):
@@ -129,10 +117,9 @@ def fetch_titles(source, d, session, page=1):
                 time.sleep(10 * (attempt + 1))
         except requests.RequestException:
             time.sleep(5 * (attempt + 1))
-    return None  # gagal -> tidak di-cache, akan dicoba lagi saat dijalankan ulang
+    return None 
 
-
-# ------------------------------------------------------------------ perintah: test
+# Test
 def cmd_test(_):
     s = requests.Session()
     d = END - timedelta(days=3)
@@ -147,7 +134,7 @@ def cmd_test(_):
     print("\nJika ada sumber yang 0/None, sesuaikan URL/selector di SOURCES.")
 
 
-# ------------------------------------------------------------------ perintah: scrape
+# Scrape
 def load_cache():
     done = {}
     if CACHE.exists():
@@ -177,7 +164,7 @@ def cmd_scrape(_):
                 t1, max_page = res
                 time.sleep(random.uniform(*DELAY))
                 t2 = []
-                if max_page >= 2:  # 1 halaman acak lain -> jam terbit lebih beragam
+                if max_page >= 2:
                     res2 = fetch_titles(src, d, s, rnd.randint(2, max_page))
                     t2 = res2[0] if res2 else []
                 half = PER_DAY // 2
@@ -192,7 +179,7 @@ def cmd_scrape(_):
                 print(f"progress {n}/{total} (sampai {d})")
 
 
-# ------------------------------------------------------------------ perintah: build
+# Build
 def cmd_build(_):
     import numpy as np
     from sentence_transformers import SentenceTransformer
@@ -202,13 +189,12 @@ def cmd_build(_):
     for (src, d), titles in load_cache().items():
         for t in titles:
             k = norm(t)
-            if k in seen:              # 1) duplikat persis (setelah normalisasi)
+            if k in seen:              
                 continue
             seen.add(k)
             rows.append({"source": src, "date": date.fromisoformat(d), "title": t})
     print(f"data mentah unik (exact): {len(rows)}")
 
-    # 2) duplikat semantik: berita yang sama dengan judul berbeda (lintas sumber juga)
     model = SentenceTransformer(EMB_MODEL)
     emb = model.encode([r["title"] for r in rows], normalize_embeddings=True,
                        batch_size=64, show_progress_bar=True)
@@ -225,7 +211,6 @@ def cmd_build(_):
         by_date[d].append(i)
     print(f"setelah dedup semantik: {len(kept)}")
 
-    # 3) sampling merata per bulan, per sumber (round-robin antar bulan)
     srcs = list(SOURCES)
     base, extra = divmod(TARGET_TOTAL, len(srcs))
     final = []
@@ -248,7 +233,7 @@ def cmd_build(_):
     final.sort(key=lambda i: (rows[i]["date"], rows[i]["source"]))
     with OUT.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["title", "date", "source"])  # kolom source boleh dihapus
+        w.writerow(["title", "date", "source"])
         for i in final:
             r = rows[i]
             w.writerow([r["title"], r["date"].isoformat(), r["source"]])

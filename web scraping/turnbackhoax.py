@@ -13,8 +13,8 @@ from tqdm import tqdm
 BASE_URL = "https://turnbackhoax.id"
 ARTICLES_URL = f"{BASE_URL}/articles"
 
-START_DATE = datetime(2024, 1, 1)
-END_DATE = datetime.now()
+START_DATE = datetime(2024, 1, 1) # January 2024
+END_DATE = datetime.now() # September 2026
 
 OUTPUT_FILE = "datasets/raw/turnbackhoax_2024_2026_raw.csv"
 CHECKPOINT_FILE = "datasets/raw/turnbackhoax_checkpoint.json"
@@ -139,9 +139,7 @@ def get_article_links(page):
         # ----------------------------------------------------
         # TITLE
         # ----------------------------------------------------
-
-        # The visible h2 spans are truncated for the responsive layout.
-        # The image alt attribute contains the complete article title.
+        
         image = card.find("img", alt=True)
         title = image.get("alt", "").strip() if image else None
 
