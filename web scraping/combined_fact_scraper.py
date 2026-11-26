@@ -17,8 +17,8 @@ import requests
 from bs4 import BeautifulSoup
 
 # Configuration
-START = date(2024, 1, 1)
-END = date(2026, 9, 23)          
+START = date(2024, 1, 1) # Start: 1 January 2024
+END = date(2026, 9, 23)  # End: 23 September 2026
 TARGET_TOTAL = 6394         
 PER_DAY = 4                     
 MAX_PAGE_FALLBACK = 5         
